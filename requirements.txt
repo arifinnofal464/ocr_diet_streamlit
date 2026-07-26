@@ -1,0 +1,7 @@
+streamlit
+paddlepaddle
+paddleocr>=3.0.0
+spacy>=3.7,<3.9
+opencv-python-headless
+numpy
+pandas
