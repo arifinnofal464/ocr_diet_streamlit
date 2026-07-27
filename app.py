@@ -108,12 +108,16 @@ def load_ocr_engine():
         # dibanding default "server" -- penting karena Streamlit Community
         # Cloud gratis hanya menyediakan RAM terbatas (~1 GB per app).
         text_detection_model_name="PP-OCRv5_mobile_det",
-        # Matikan koreksi orientasi otomatis (dokumen & baris teks) supaya
-        # tidak perlu memuat 2 model tambahan -- aktifkan lagi (set True)
-        # kalau foto kemasan sering ter-upload dalam posisi miring/terbalik.
+        # Model recognition mobile untuk lang="id" (huruf latin) sudah
+        # otomatis dipilih PaddleOCR sebagai "latin_PP-OCRv5_mobile_rec"
+        # -- tidak perlu di-override manual.
+        # `use_doc_orientation_classify` dimatikan karena paling berat (model
+        # tambahan besar). `use_textline_orientation` dicoba dinyalakan lagi
+        # (model tambahan kecil) untuk memperbaiki akurasi pengelompokan
+        # baris teks -- kalau ini masih memicu OOM, matikan lagi ke False.
         use_doc_orientation_classify=False,
         use_doc_unwarping=False,
-        use_textline_orientation=False,
+        use_textline_orientation=True,
         lang="id",
         ocr_version="PP-OCRv5",
         enable_mkldnn=False,
