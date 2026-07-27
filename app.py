@@ -104,9 +104,16 @@ RULE_ENGINE_CONFIG = {
 def load_ocr_engine():
     from paddleocr import PaddleOCR
     return PaddleOCR(
-        use_doc_orientation_classify=True,
+        # Model deteksi versi "mobile" jauh lebih ringan (RAM & waktu load)
+        # dibanding default "server" -- penting karena Streamlit Community
+        # Cloud gratis hanya menyediakan RAM terbatas (~1 GB per app).
+        text_detection_model_name="PP-OCRv5_mobile_det",
+        # Matikan koreksi orientasi otomatis (dokumen & baris teks) supaya
+        # tidak perlu memuat 2 model tambahan -- aktifkan lagi (set True)
+        # kalau foto kemasan sering ter-upload dalam posisi miring/terbalik.
+        use_doc_orientation_classify=False,
         use_doc_unwarping=False,
-        use_textline_orientation=True,
+        use_textline_orientation=False,
         lang="id",
         ocr_version="PP-OCRv5",
         enable_mkldnn=False,
@@ -848,7 +855,7 @@ with st.sidebar:
         st.dataframe(
             build_nutrition_table(daily_targets, consumption_limits, konsumsi),
             hide_index=True,
-            use_container_width=True,
+            width="stretch",
         )
 
 # ------------------------------------------------------------------
@@ -888,11 +895,11 @@ if uploaded_file is not None:
     col1, col2 = st.columns(2)
     with col1:
         st.markdown('<div class="section-label">🖼️ Foto Asli</div>', unsafe_allow_html=True)
-        st.image(tmp_path, use_container_width=True)
+        st.image(tmp_path, width="stretch")
     with col2:
         st.markdown('<div class="section-label">✂️ Area Informasi Gizi</div>', unsafe_allow_html=True)
         if output_record["cropped_image_path"]:
-            st.image(output_record["cropped_image_path"], use_container_width=True)
+            st.image(output_record["cropped_image_path"], width="stretch")
         else:
             st.warning("Area 'Informasi Nilai Gizi' tidak ditemukan. Coba foto dengan sudut/pencahayaan lebih baik.")
 
@@ -934,7 +941,7 @@ if uploaded_file is not None:
 
         if result["rows"]:
             st.markdown('<div class="section-label">📊 Rincian Kandungan Gizi vs Batas Amanmu</div>', unsafe_allow_html=True)
-            st.dataframe(pd.DataFrame(result["rows"]), hide_index=True, use_container_width=True)
+            st.dataframe(pd.DataFrame(result["rows"]), hide_index=True, width="stretch")
 
         if result["reason"]:
             with st.expander("💬 Kenapa hasilnya begini?"):
@@ -946,7 +953,7 @@ if uploaded_file is not None:
             with tab1:
                 st.text("\n".join(output_record["extracted_text_lines"]) or "(tidak ada teks terbaca)")
                 if entities:
-                    st.dataframe(pd.DataFrame(entities)[["entity", "value", "confidence"]], hide_index=True, use_container_width=True)
+                    st.dataframe(pd.DataFrame(entities)[["entity", "value", "confidence"]], hide_index=True, width="stretch")
             with tab2:
                 st.json({
                     "nutrition_data": output_record.get("nutrition_data"),
