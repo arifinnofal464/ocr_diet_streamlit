@@ -6,8 +6,12 @@ Bagian training (spaCy NER training, dataset annotation) SENGAJA tidak
 disertakan di sini -- app ini hanya menjalankan tahap INFERENCE:
   1. Upload foto label kemasan
   2. OCR (PaddleOCR) -> crop area "Informasi Nilai Gizi" + ekstrak baris teks
-  3. NER (model spaCy yang sudah dilatih, folder `model-best/`)
-  4. Rule Engine -> evaluasi kelayakan produk untuk diet Diabetes
+  3. Template matching posisi label<->nilai (SUMBER UTAMA nutrition_data --
+     tahan terhadap OCR yang gagal membaca sebagian teks)
+  4. NER (model spaCy yang sudah dilatih, folder `model-best/`) sebagai
+     sumber tambahan/silang-cek
+  5. Rule Engine -> evaluasi kelayakan produk untuk diet Diabetes, memakai
+     NER dahulu lalu fallback ke hasil template matching kalau NER kosong
 """
 
 import os
@@ -94,6 +98,21 @@ RULE_ENGINE_CONFIG = {
             "PUFA": {"target_key": "pufa_g", "display": "Lemak Tak Jenuh Ganda"},
         },
     },
+}
+
+# Peta label entitas NER (dipakai RULE_ENGINE_CONFIG di atas) ke key hasil
+# label-window template matching (NUTRITION_FIELD_TEMPLATE di bawah). Dipakai
+# sebagai FALLBACK ketika NER gagal menemukan entitas tsb pada teks OCR.
+TEMPLATE_FIELD_MAP = {
+    "GULA": "gula",
+    "KARBOHIDRAT": "karbohidrat_total",
+    "PROTEIN": "protein",
+    "LEMAK_TOTAL": "lemak_total",
+    "LEMAK_JENUH": "lemak_jenuh",
+    "SERAT_PANGAN": "serat_pangan",
+    "KOLESTEROL": "kolesterol",
+    "MUFA": "lemak_tak_jenuh_tunggal",
+    "PUFA": "lemak_tak_jenuh_ganda",
 }
 
 
@@ -571,6 +590,287 @@ def parse_nutrition_lines(lines):
     return result
 
 
+# ------------------------------------------------------------------
+# 3b. LABEL-WINDOW TEMPLATE MATCHING (dari notebook -- SUMBER UTAMA
+#     nutrition_data yang dipakai sebagai fallback rule engine).
+#
+#     Berbeda dari parse_nutrition_lines() di atas (yang meregex SATU
+#     baris teks utuh "Nama Angka Satuan %"), pendekatan ini memisahkan
+#     item OCR jadi dua kelompok -- LABEL (nama zat gizi) dan VALUE
+#     (angka/satuan/persen) -- lalu memasangkan tiap label dengan value
+#     TERDEKAT secara posisi vertikal. Ini jauh lebih tahan ketika OCR
+#     "kehilangan" sebagian teks di satu baris (mis. angka "1g" tidak
+#     ikut terbaca berdampingan dengan labelnya), karena value tetap bisa
+#     dipasangkan selama masih ada di baris yang berdekatan.
+# ------------------------------------------------------------------
+
+# Urutan list ini MENENTUKAN urutan pencarian -- jangan diacak.
+NUTRITION_FIELD_TEMPLATE = [
+    ("energi_total",              ["ENERGI TOTAL", "TOTAL ENERGY", "ENERGY", "CALORIES", "TOTAL CALORIES"], "kkal", True),
+    ("energi_dari_lemak",         ["ENERGI DARI LEMAK", "ENERGY FROM FAT", "CALORIES FROM FAT"],            "kkal", True),
+    ("energi_dari_lemak_jenuh",   ["ENERGI DARI LEMAK JENUH", "ENERGY FROM SATURATED FAT", "CALORIES FROM SATURATED FAT"], "kkal", False),
+    ("lemak_total",               ["LEMAK TOTAL", "TOTAL FAT"],                                             "g",    True),
+    ("lemak_trans",               ["LEMAK TRANS", "TRANS FAT"],                                             "g",    False),
+    ("lemak_jenuh",               ["LEMAK JENUH", "SATURATED FAT"],                                         "g",    True),
+    ("lemak_tak_jenuh_tunggal",   ["LEMAK TAK JENUH TUNGGAL", "MONOUNSATURATED FAT"],                       "g",    False),
+    ("lemak_tak_jenuh_ganda",     ["LEMAK TAK JENUH GANDA", "POLYUNSATURATED FAT"],                         "g",    False),
+    ("kolesterol",                ["KOLESTEROL", "CHOLESTEROL"],                                            "mg",   False),
+    ("protein",                   ["PROTEIN"],                                                               "g",    True),
+    ("karbohidrat_total",         ["KARBOHIDRAT TOTAL", "TOTAL CARBOHYDRATE", "TOTAL CARBOHYDRATES", "KARBOHIDRAT"], "g", True),
+    ("serat_pangan",              ["SERAT PANGAN", "DIETARY FIBER", "DIETARY FIBRE", "SERAT", "FIBER", "FIBRE"], "g", False),
+    ("gula",                      ["GULA", "SUGAR", "SUGARS", "TOTAL SUGAR", "TOTAL SUGARS"],                "g",    True),
+    ("sukrosa",                   ["SUKROSA", "SUCROSE"],                                                   "g",    False),
+    ("laktosa",                   ["LAKTOSA", "LACTOSE"],                                                   "g",    False),
+    ("garam_natrium",             ["GARAM NATRIUM", "GARAM (NATRIUM)", "SALT SODIUM", "SALT (SODIUM)", "NATRIUM", "SODIUM", "GARAM", "SALT"], "mg", True),
+]
+
+_VALUE_TOKEN_RE = re.compile(r"^(\d+[.,]?\d*)\s*(KKAL|KAL|MG|MCG|G)?$")
+_PERCENT_TOKEN_RE = re.compile(r"^(\d+[.,]?\d*)\s*%$")
+_BARE_UNIT_WORDS = {"G", "KG", "MG", "MCG", "KKAL", "KAL", "ML", "L"}
+
+_TAKARAN_SAJI_RE = re.compile(r"Takaran\s*Saji\b.*?([\d.,]+\s*(?:mL|ml|g|G))", re.IGNORECASE)
+_SAJIAN_PER_KEMASAN_RE = re.compile(r"([\d.,]+)\s*Sajian\s*per\s*Kemasan", re.IGNORECASE)
+_SAJIAN_PER_KEMASAN_RE_AFTER = re.compile(r"Sajian\s*per\s*Kemasan.*?([\d.,]+)", re.IGNORECASE)
+
+
+def _is_valueish(norm_text):
+    tok = norm_text.replace(" ", "")
+    if _PERCENT_TOKEN_RE.match(tok):
+        return True
+    if _VALUE_TOKEN_RE.match(tok):
+        return True
+    if tok in _BARE_UNIT_WORDS:
+        return True
+    return False
+
+
+def parse_nutrition_header(lines):
+    """Cari 'Takaran Saji' & 'Sajian per Kemasan' dari GABUNGAN semua teks
+    baris mentah (bukan dari baris hasil rekonstruksi), supaya tetap kena
+    walau baris rekonstruksinya kacau akibat teks lain yang menempel."""
+    result = {"takaran_saji": None, "sajian_per_kemasan": None}
+    joined_text = " ".join(l["text"] for l in lines)
+
+    m = _TAKARAN_SAJI_RE.search(joined_text)
+    if m:
+        result["takaran_saji"] = m.group(1).strip()
+
+    m = _SAJIAN_PER_KEMASAN_RE.search(joined_text) or _SAJIAN_PER_KEMASAN_RE_AFTER.search(joined_text)
+    if m:
+        result["sajian_per_kemasan"] = float(m.group(1).replace(",", "."))
+
+    return result
+
+
+def _cluster_into_rows_and_flatten(items, y_threshold_ratio=0.6):
+    if not items:
+        return []
+    items_sorted = sorted(items, key=lambda i: i["y_center"])
+    rows = [[items_sorted[0]]]
+    for item in items_sorted[1:]:
+        row = rows[-1]
+        avg_y = sum(i["y_center"] for i in row) / len(row)
+        avg_h = sum(i["height"] for i in row) / len(row)
+        if abs(item["y_center"] - avg_y) <= avg_h * y_threshold_ratio:
+            row.append(item)
+        else:
+            rows.append([item])
+    rows.sort(key=lambda r: sum(i["y_center"] for i in r) / len(r))
+    flat = []
+    for row in rows:
+        row.sort(key=lambda i: i["x_left"])
+        flat.extend(row)
+    return flat
+
+
+def parse_nutrition_table_by_template(lines, debug=False):
+    """SUMBER UTAMA nutrition_data (fallback rule engine). Memisahkan item
+    OCR jadi LABEL vs VALUE, lalu memasangkan tiap field template dengan
+    value TERDEKAT secara posisi -- kebal terhadap label yang gagal
+    terdeteksi OCR maupun value yang "meloncat" baris."""
+    NOISE_WORDS = {
+        "LAYANAN", "KONSUMEN", "INDOFOOD", "BPOM", "BUKTIKAN", "STATUS",
+        "SINI", "INDONESIA", "BANGGA", "BUATAN", "RI",
+    }
+
+    all_items = _items_from_lines(lines)
+    all_items = [
+        i for i in all_items
+        if not re.match(r"^\d{6,}$", i["text"])  # buang nomor produksi/barcode panjang
+        and i["norm"] not in NOISE_WORDS
+    ]
+
+    label_items = [i for i in all_items if not _is_valueish(i["norm"])]
+    value_items = [i for i in all_items if _is_valueish(i["norm"])]
+
+    label_items = sorted(label_items, key=lambda i: i["y_top"])
+    value_items = _cluster_into_rows_and_flatten(value_items)
+
+    used_label = [False] * len(label_items)
+    field_groups = []
+
+    search_from = 0
+    for f_idx, (key, variants, unit, required) in enumerate(NUTRITION_FIELD_TEMPLATE):
+        norm_variants = [_norm_kw(v) for v in variants]
+        variant_word_lists = [v.split() for v in norm_variants]
+        order = sorted(range(len(variant_word_lists)), key=lambda vi: -len(variant_word_lists[vi]))
+
+        found_at = None
+        for vi in order:
+            target_words = variant_word_lists[vi]
+            target_set = set(target_words)
+            target_joined = " ".join(target_words)
+
+            for span in (1, 2, 3):
+                for i in range(search_from, len(label_items) - span + 1):
+                    if any(used_label[j] for j in range(i, i + span)):
+                        continue
+                    window_words = []
+                    for j in range(i, i + span):
+                        window_words.extend(_norm_kw(label_items[j]["text"]).split())
+                    if not window_words:
+                        continue
+                    window_set = set(window_words)
+
+                    # (a) Target jadi SUBSET dari kata di jendela ini --
+                    # menoleransi box BILINGUAL yang berisi kata TAMBAHAN.
+                    subset_match = target_set.issubset(window_set)
+                    # (b) Fallback fuzzy -- menoleransi typo OCR per-kata.
+                    fuzzy_score = _fuzzy_ratio(" ".join(window_words), target_joined)
+                    fuzzy_match = fuzzy_score >= 0.65
+
+                    if subset_match or fuzzy_match:
+                        found_at = (i, i + span)
+                        break
+                if found_at:
+                    break
+            if found_at:
+                break
+
+        if not found_at:
+            if debug:
+                print(f"[template] field '{key}' tidak ditemukan, dilewati.")
+            continue
+
+        i_start, i_end = found_at
+        for j in range(i_start, i_end):
+            used_label[j] = True
+        y_top = min(label_items[j]["y_top"] for j in range(i_start, i_end))
+        y_bottom = max(label_items[j]["y_bottom"] for j in range(i_start, i_end))
+        field_groups.append((f_idx, y_top, y_bottom))
+        search_from = i_end
+
+    used_value = [False] * len(value_items)
+    results = {}
+
+    # Anchor tiap field pada Y-CENTER label ITU SENDIRI, lalu pasangkan
+    # dengan value yang jaraknya PALING DEKAT secara vertikal -- tahan
+    # terhadap kotak label yang saling tumpang-tindih (foto miring).
+    _heights = [i_["height"] for i_ in label_items] or [40]
+    typical_h = sorted(_heights)[len(_heights) // 2]
+    MAX_VALUE_DISTANCE = typical_h * 1.5
+
+    for f_idx, y_top, y_bottom in field_groups:
+        key, variants, unit, required = NUTRITION_FIELD_TEMPLATE[f_idx]
+        anchor_y = (y_top + y_bottom) / 2
+
+        candidates = [
+            (idx, v, abs(v["y_center"] - anchor_y))
+            for idx, v in enumerate(value_items)
+            if not used_value[idx] and abs(v["y_center"] - anchor_y) <= MAX_VALUE_DISTANCE
+        ]
+        candidates.sort(key=lambda t: (t[2], t[1]["x_left"]))
+
+        value, value_unit, percent = None, None, None
+        k = 0
+        while k < len(candidates):
+            idx, item, _dist = candidates[k]
+            tok = item["norm"].replace(" ", "")
+            m_pct = _PERCENT_TOKEN_RE.match(tok)
+            m_val = _VALUE_TOKEN_RE.match(tok)
+
+            if m_pct and percent is None and key != "gula":
+                percent = m_pct.group(1).replace(",", ".")
+                used_value[idx] = True
+            elif m_val and value is None:
+                num, u = m_val.groups()
+                if u:
+                    value, value_unit = num, u.lower()
+                    used_value[idx] = True
+                else:
+                    if k + 1 < len(candidates):
+                        idx2, item2, _d2 = candidates[k + 1]
+                        u2 = item2["norm"].strip()
+                        if u2 in ("G", "MG", "KKAL", "KAL", "MCG"):
+                            value, value_unit = num, u2.lower()
+                            used_value[idx] = True
+                            used_value[idx2] = True
+                            k += 1
+                        else:
+                            value, value_unit = num, unit
+                            used_value[idx] = True
+                    else:
+                        value, value_unit = num, unit
+                        used_value[idx] = True
+            k += 1
+            if value is not None and percent is not None:
+                break
+
+        results[key] = {
+            "label": variants[0].title(),
+            "value": value,
+            "unit": value_unit or unit,
+            "percent_akg": f"{percent}%" if percent else None,
+        }
+
+    return results
+
+
+def validate_template_result(template_result):
+    """Field WAJIB yang tidak ketemu sama sekali oleh template matching --
+    indikasi ada label yang benar-benar gagal terdeteksi OCR."""
+    warnings = []
+    for field_key, variants, unit, required in NUTRITION_FIELD_TEMPLATE:
+        if required and field_key not in template_result:
+            warnings.append(
+                f"⚠️ Field wajib '{variants[0]}' tidak terdeteksi dari template matching -- "
+                f"kemungkinan ada kata pada label yang gagal terbaca OCR."
+            )
+    return warnings
+
+
+def template_result_to_nutrition_data(template_result, header_info=None):
+    """Ubah dict hasil parse_nutrition_table_by_template() jadi bentuk yang
+    sama seperti output parse_nutrition_lines():
+    {"basis", "takaran_saji", "sajian_per_kemasan", "nutrients": {key: {"value","unit","akg_percent"}}}
+    -- key di sini pakai key NUTRITION_FIELD_TEMPLATE (mis. "lemak_total"),
+    dipetakan lagi ke label RuleEngine lewat TEMPLATE_FIELD_MAP."""
+    header_info = header_info or {}
+    result = {
+        "basis": "sajian" if header_info.get("takaran_saji") else None,
+        "takaran_saji": header_info.get("takaran_saji"),
+        "sajian_per_kemasan": header_info.get("sajian_per_kemasan"),
+        "nutrients": {},
+    }
+    for field_key, variants, unit, required in NUTRITION_FIELD_TEMPLATE:
+        entry = template_result.get(field_key)
+        if entry is None or entry.get("value") is None:
+            continue
+        try:
+            value_num = float(str(entry["value"]).replace(",", "."))
+        except (TypeError, ValueError):
+            continue
+        nutrient_entry = {"value": value_num, "unit": entry.get("unit") or unit}
+        percent = entry.get("percent_akg")
+        if percent:
+            try:
+                nutrient_entry["akg_percent"] = float(str(percent).replace("%", "").replace(",", "."))
+            except ValueError:
+                pass
+        result["nutrients"][field_key] = nutrient_entry
+    return result
+
+
 def run_extraction_pipeline(ocr_engine, image_path):
     output_record = {
         "image_file": image_path, "diet_choice": "Diabetes", "extraction_method": None,
@@ -595,6 +895,9 @@ def run_extraction_pipeline(ocr_engine, image_path):
         cv2.imwrite(crop_path, cropped)
         output_record["cropped_image_path"] = crop_path
 
+        # --- [LAMA] row-reconstruction: TETAP dijalankan untuk teks yang
+        # ditampilkan ke user & jadi input NER, TAPI TIDAK LAGI jadi sumber
+        # utama nutrition_data (lihat template matching di bawah). ---
         items = _items_from_lines(section_lines)
         rows, _ = _cluster_rows_improved(items)
         display_rows = process_row_items_to_text(rows, max_x_gap_multi_column=600)
@@ -604,8 +907,24 @@ def run_extraction_pipeline(ocr_engine, image_path):
         output_record["extracted_text_lines"] = fuzzy_rows
         output_record["fuzzy_term_corrections"] = fuzzy_corrections_log
 
-        nutrition_data = parse_nutrition_lines(fuzzy_rows)
-        output_record["nutrition_data"] = nutrition_data
+        # --- [BARU] label-window template matching -- SUMBER UTAMA
+        # nutrition_data sekarang, karena kebal terhadap label/value yang
+        # gagal terdeteksi berdampingan oleh OCR. ---
+        header_info = parse_nutrition_header(section_lines)
+        template_result = parse_nutrition_table_by_template(section_lines)
+        template_nutrition_data = template_result_to_nutrition_data(template_result, header_info)
+
+        # Nutrition data lama (regex baris tunggal) tetap dihitung sebagai
+        # pelengkap/arsip, tapi sajian_per_kemasan & takaran_saji diprioritaskan
+        # dari header_info (lebih tahan noise) kalau versi lama tidak ketemu.
+        legacy_nutrition_data = parse_nutrition_lines(fuzzy_rows)
+        legacy_nutrition_data["takaran_saji"] = legacy_nutrition_data.get("takaran_saji") or header_info.get("takaran_saji")
+        legacy_nutrition_data["sajian_per_kemasan"] = legacy_nutrition_data.get("sajian_per_kemasan") or header_info.get("sajian_per_kemasan")
+
+        output_record["nutrition_data"] = legacy_nutrition_data
+        output_record["template_result"] = template_result
+        output_record["template_nutrition_data"] = template_nutrition_data
+        output_record["template_warnings"] = validate_template_result(template_result)
     return output_record
 
 
@@ -682,11 +1001,16 @@ class RuleEngine:
     def __init__(self, config=None):
         self.config = config if config is not None else RULE_ENGINE_CONFIG
 
-    def evaluate_diabetes(self, entities, nutrition_data, consumption_limits):
+    def evaluate_diabetes(self, entities, nutrition_data, consumption_limits, template_nutrition_data=None):
         cfg = self.config["diabetes"]
         nutrient_cfg = cfg["nutrient_labels"]
         nutrition_data = nutrition_data or {}
-        raw_servings = nutrition_data.get("sajian_per_kemasan")
+        template_nutrition_data = template_nutrition_data or {}
+        template_nutrients = template_nutrition_data.get("nutrients", {})
+
+        # Sajian per kemasan: prioritas NER-regex based nutrition_data,
+        # fallback ke hasil template matching (lebih tahan noise).
+        raw_servings = nutrition_data.get("sajian_per_kemasan") or template_nutrition_data.get("sajian_per_kemasan")
 
         reason = []
         if raw_servings is None:
@@ -703,13 +1027,43 @@ class RuleEngine:
             display = meta["display"]
             is_min = meta.get("is_minimum_requirement", False)
             limit = consumption_limits.get(meta["target_key"]) if consumption_limits else None
+
+            value_per_serving = None
+            value_source = None
+
+            # 1) Coba dari entitas NER spaCy dulu (kalau modelnya berhasil
+            #    mengenali baris teks OCR).
             ent = next((e for e in entities if e["entity"] == label), None)
-            if ent is None:
-                reason.append(f"{display}: entitas tidak ditemukan pada hasil OCR/NER -- dilewati.")
-                continue
-            value_per_serving, _unit = parse_numeric_entity(ent["value"])
+            if ent is not None:
+                parsed_value, _unit = parse_numeric_entity(ent["value"])
+                if parsed_value is not None:
+                    value_per_serving = parsed_value
+                    value_source = "NER"
+
+            # 2) FALLBACK: kalau NER tidak menemukan entitas ini (atau
+            #    gagal mem-parsing angkanya) -- misal karena OCR kehilangan
+            #    sebagian teks di baris tsb -- ambil dari hasil label-window
+            #    template matching, yang memasangkan label & value
+            #    berdasarkan posisi, bukan satu baris teks utuh.
+            if value_per_serving is None:
+                t_key = TEMPLATE_FIELD_MAP.get(label)
+                t_entry = template_nutrients.get(t_key) if t_key else None
+                if t_entry is not None and t_entry.get("value") is not None:
+                    value_per_serving = t_entry["value"]
+                    value_source = "template"
+
             if value_per_serving is None or limit is None:
+                reason.append(
+                    f"{display}: entitas tidak ditemukan pada hasil OCR/NER maupun template matching -- dilewati."
+                )
                 continue
+
+            if value_source == "template":
+                reason.append(
+                    f"{display}: NER tidak menemukan entitas ini pada teks OCR, nilai diambil dari "
+                    f"pencocokan posisi label & nilai (template matching) sebagai cadangan."
+                )
+
             params.append({"label": label, "display": display, "is_min": is_min, "limit": limit, "value_per_serving": value_per_serving})
 
         max_daily_servings = 0
@@ -1008,7 +1362,12 @@ if uploaded_file is not None:
             entities = extract_entities_with_confidence(nlp_ner, doc)
 
         rule_engine = RuleEngine()
-        result = rule_engine.evaluate_diabetes(entities, output_record.get("nutrition_data"), consumption_limits)
+        result = rule_engine.evaluate_diabetes(
+            entities,
+            output_record.get("nutrition_data"),
+            consumption_limits,
+            template_nutrition_data=output_record.get("template_nutrition_data"),
+        )
 
         # --- Kartu status utama ---
         status_meta = {
@@ -1046,20 +1405,46 @@ if uploaded_file is not None:
                 for r in result["reason"]:
                     st.write(f"• {r}")
 
+        template_warnings = output_record.get("template_warnings") or []
+        if template_warnings:
+            with st.expander("⚠️ Peringatan pembacaan label"):
+                for w in template_warnings:
+                    st.write(f"• {w}")
+
         with st.expander("🔍 Detail teknis (teks OCR & entitas terdeteksi)"):
             adaptive_steps = (output_record.get("preprocessing") or {}).get("adaptive_steps", [])
             if adaptive_steps:
                 st.caption("Preprocessing otomatis yang diterapkan ke foto sebelum OCR:")
                 for step in adaptive_steps:
                     st.write(f"• {step}")
-            tab1, tab2 = st.tabs(["Teks Hasil OCR", "Data Mentah (JSON)"])
+            tab1, tab2, tab3 = st.tabs(["Teks Hasil OCR", "Template Matching (fallback)", "Data Mentah (JSON)"])
             with tab1:
                 st.text("\n".join(output_record["extracted_text_lines"]) or "(tidak ada teks terbaca)")
                 if entities:
                     st.dataframe(pd.DataFrame(entities)[["entity", "value", "confidence"]], hide_index=True, width="stretch")
             with tab2:
+                st.caption(
+                    "Hasil pencocokan posisi label & nilai (dipakai HANYA kalau NER di atas "
+                    "gagal menemukan entitas yang sesuai)."
+                )
+                template_result = output_record.get("template_result") or {}
+                if template_result:
+                    tpl_rows = [
+                        {
+                            "Field": entry["label"],
+                            "Nilai": entry["value"],
+                            "Satuan": entry["unit"],
+                            "%AKG": entry["percent_akg"],
+                        }
+                        for entry in template_result.values()
+                    ]
+                    st.dataframe(pd.DataFrame(tpl_rows), hide_index=True, width="stretch")
+                else:
+                    st.write("(tidak ada hasil template matching)")
+            with tab3:
                 st.json({
                     "nutrition_data": output_record.get("nutrition_data"),
+                    "template_nutrition_data": output_record.get("template_nutrition_data"),
                     "entities": entities,
                     "rule_engine_result": result,
                 })
