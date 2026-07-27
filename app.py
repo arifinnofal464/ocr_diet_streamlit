@@ -104,18 +104,16 @@ RULE_ENGINE_CONFIG = {
 def load_ocr_engine():
     from paddleocr import PaddleOCR
     return PaddleOCR(
-        # Model deteksi versi "mobile" jauh lebih ringan (RAM & waktu load)
-        # dibanding default "server" -- penting karena Streamlit Community
-        # Cloud gratis hanya menyediakan RAM terbatas (~1 GB per app).
+        # Kembali ke model deteksi "mobile" (ringan) karena kita tetap di
+        # Streamlit Community Cloud (~1 GB RAM) -- Hugging Face Spaces free
+        # tier ternyata sekarang mensyaratkan paket berbayar untuk Docker
+        # Space, jadi bukan opsi gratis lagi.
         text_detection_model_name="PP-OCRv5_mobile_det",
-        # Model recognition mobile untuk lang="id" (huruf latin) sudah
-        # otomatis dipilih PaddleOCR sebagai "latin_PP-OCRv5_mobile_rec"
-        # -- tidak perlu di-override manual.
-        # `use_doc_orientation_classify` dimatikan karena paling berat (model
-        # tambahan besar). `use_textline_orientation` dicoba dinyalakan lagi
-        # (model tambahan kecil) untuk memperbaiki akurasi pengelompokan
-        # baris teks -- kalau ini masih memicu OOM, matikan lagi ke False.
-        use_doc_orientation_classify=False,
+        # `use_doc_orientation_classify` dicoba dinyalakan lagi -- model ini
+        # (PP-LCNet_x1_0_doc_ori) jauh lebih kecil daripada model deteksi
+        # teks, jadi kemungkinan aman dipakai bareng model mobile tanpa OOM.
+        # Kalau ternyata masih memicu OOM, matikan lagi ke False.
+        use_doc_orientation_classify=True,
         use_doc_unwarping=False,
         use_textline_orientation=True,
         lang="id",
