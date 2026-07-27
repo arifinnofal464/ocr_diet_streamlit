@@ -108,16 +108,19 @@ def load_ocr_engine():
         # Streamlit Community Cloud (~1 GB RAM) -- Hugging Face Spaces free
         # tier ternyata sekarang mensyaratkan paket berbayar untuk Docker
         # Space, jadi bukan opsi gratis lagi.
+        #
+        # Catatan: begitu `text_detection_model_name` diset manual,
+        # PaddleOCR MENGABAIKAN parameter `lang`/`ocr_version` untuk memilih
+        # model recognition (sempat memicu UserWarning). Supaya tetap benar
+        # pakai model recognition huruf latin (Indonesia), kita sebutkan
+        # `text_recognition_model_name` secara eksplisit juga.
         text_detection_model_name="PP-OCRv5_mobile_det",
-        # `use_doc_orientation_classify` dicoba dinyalakan lagi -- model ini
-        # (PP-LCNet_x1_0_doc_ori) jauh lebih kecil daripada model deteksi
-        # teks, jadi kemungkinan aman dipakai bareng model mobile tanpa OOM.
-        # Kalau ternyata masih memicu OOM, matikan lagi ke False.
+        text_recognition_model_name="latin_PP-OCRv5_mobile_rec",
+        # `use_doc_orientation_classify` aman dinyalakan -- modelnya jauh
+        # lebih kecil daripada model deteksi teks, jadi tidak memicu OOM.
         use_doc_orientation_classify=True,
         use_doc_unwarping=False,
         use_textline_orientation=True,
-        lang="id",
-        ocr_version="PP-OCRv5",
         enable_mkldnn=False,
     )
 
@@ -202,6 +205,91 @@ def resize_if_too_large(image_path, max_side=1800):
         img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
         cv2.imwrite(image_path, img)
     return image_path
+
+
+def _estimate_blur_score(gray):
+    """Skor ketajaman via varians Laplacian -- makin kecil, makin blur."""
+    return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+
+
+def _estimate_skew_angle_deg(gray):
+    """Perkirakan sudut kemiringan teks dari sebaran piksel gelap."""
+    thr = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 31, 15)
+    coords = cv2.findNonZero(thr)
+    if coords is None or len(coords) < 200:
+        return 0.0
+    angle = cv2.minAreaRect(coords)[-1]
+    if angle < -45:
+        angle = 90 + angle
+    elif angle > 45:
+        angle = angle - 90
+    return float(angle)
+
+
+def _deskew_image(img, angle_deg):
+    h, w = img.shape[:2]
+    center = (w // 2, h // 2)
+    M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+    return cv2.warpAffine(img, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+
+
+def adaptive_preprocess(
+    image_path,
+    min_target_side=1800,
+    skew_threshold_deg=1.5,
+    contrast_std_threshold=40.0,
+    blur_threshold=120.0,
+):
+    """Preprocessing ADAPTIF sebelum OCR (dari notebook, Bagian 4): tiap
+    langkah HANYA diterapkan kalau kondisi foto memang membutuhkannya --
+    upscale foto kecil, deskew foto miring, perbaiki kontras rendah (CLAHE),
+    dan pertajam foto blur. Ini penting untuk foto close-up/miring seperti
+    yang sering diambil dari HP."""
+    img = cv2.imread(image_path)
+    if img is None:
+        return image_path, {"applied_steps": [], "error": "gagal membaca gambar"}
+
+    info = {"applied_steps": []}
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+    h, w = img.shape[:2]
+    longest_side = max(h, w)
+    if longest_side < min_target_side:
+        scale = min_target_side / longest_side
+        img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        info["applied_steps"].append(f"upscale x{scale:.2f}")
+
+    angle = _estimate_skew_angle_deg(gray)
+    if abs(angle) > skew_threshold_deg:
+        img = _deskew_image(img, angle)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        info["applied_steps"].append(f"deskew {angle:.2f} derajat")
+
+    contrast_std = float(gray.std())
+    if contrast_std < contrast_std_threshold:
+        lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+        l_ch, a_ch, b_ch = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+        l_ch = clahe.apply(l_ch)
+        img = cv2.cvtColor(cv2.merge((l_ch, a_ch, b_ch)), cv2.COLOR_LAB2BGR)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        info["applied_steps"].append(f"CLAHE (kontras rendah, std={contrast_std:.1f})")
+
+    blur_score = _estimate_blur_score(gray)
+    if blur_score < blur_threshold:
+        gaussian = cv2.GaussianBlur(img, (0, 0), sigmaX=2.0)
+        img = cv2.addWeighted(img, 1.5, gaussian, -0.5, 0)
+        info["applied_steps"].append(f"sharpening (skor blur={blur_score:.1f})")
+
+    if not info["applied_steps"]:
+        info["applied_steps"].append("tidak ada preprocessing yang diperlukan")
+
+    base, ext = os.path.splitext(image_path)
+    processed_path = f"{base}_preproc{ext}"
+    cv2.imwrite(processed_path, img)
+    info["processed_path"] = processed_path
+    return processed_path, info
 
 
 def crop_section_by_keywords(ocr_engine, image_path, start_keywords, end_keywords,
@@ -488,9 +576,17 @@ def run_extraction_pipeline(ocr_engine, image_path):
         "image_file": image_path, "diet_choice": "Diabetes", "extraction_method": None,
         "extracted_text_lines": [], "cropped_image_path": None, "preprocessing": None,
     }
+
+    # Preprocessing adaptif (upscale/deskew/CLAHE/sharpen) sebelum OCR --
+    # penting untuk foto close-up/miring/blur seperti hasil jepretan HP.
+    preproc_path, adaptive_info = adaptive_preprocess(image_path)
+    image_for_ocr = preproc_path if os.path.exists(preproc_path) else image_path
+
     cropped, y_range, section_lines, preprocess_info = crop_section_by_keywords(
-        ocr_engine, image_path, NUTRITION_START_KEYWORDS, NUTRITION_END_KEYWORDS
+        ocr_engine, image_for_ocr, NUTRITION_START_KEYWORDS, NUTRITION_END_KEYWORDS
     )
+    preprocess_info = preprocess_info or {}
+    preprocess_info["adaptive_steps"] = adaptive_info.get("applied_steps", [])
     output_record["preprocessing"] = preprocess_info
 
     if cropped is not None and cropped.size > 0:
@@ -951,6 +1047,11 @@ if uploaded_file is not None:
                     st.write(f"• {r}")
 
         with st.expander("🔍 Detail teknis (teks OCR & entitas terdeteksi)"):
+            adaptive_steps = (output_record.get("preprocessing") or {}).get("adaptive_steps", [])
+            if adaptive_steps:
+                st.caption("Preprocessing otomatis yang diterapkan ke foto sebelum OCR:")
+                for step in adaptive_steps:
+                    st.write(f"• {step}")
             tab1, tab2 = st.tabs(["Teks Hasil OCR", "Data Mentah (JSON)"])
             with tab1:
                 st.text("\n".join(output_record["extracted_text_lines"]) or "(tidak ada teks terbaca)")
