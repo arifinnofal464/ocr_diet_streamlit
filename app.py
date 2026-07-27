@@ -23,7 +23,12 @@ import streamlit as st
 
 logging.getLogger("ppocr").setLevel(logging.ERROR)
 
-st.set_page_config(page_title="OCR Label Gizi - Diet Diabetes", layout="wide")
+st.set_page_config(
+    page_title="DietCheck — Cek Gizi Diabetes",
+    page_icon="🥗",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 # ------------------------------------------------------------------
 # 1. KATA KUNCI AREA LABEL
@@ -643,21 +648,175 @@ class RuleEngine:
 
 
 # ------------------------------------------------------------------
-# 7. STREAMLIT UI
+# 7. STYLING (custom CSS)
+# ------------------------------------------------------------------
+CUSTOM_CSS = """
+<style>
+:root {
+    --brand-green: #16a34a;
+    --brand-green-light: #dcfce7;
+    --brand-amber: #d97706;
+    --brand-amber-light: #fef3c7;
+    --brand-red: #dc2626;
+    --brand-red-light: #fee2e2;
+    --card-bg: #ffffff;
+    --card-border: #e5e7eb;
+}
+
+/* Sembunyikan menu/footer bawaan Streamlit yang tidak perlu */
+#MainMenu, footer {visibility: hidden;}
+
+/* Hero header */
+.hero-box {
+    background: linear-gradient(135deg, #16a34a 0%, #15803d 100%);
+    padding: 2.2rem 2.4rem;
+    border-radius: 18px;
+    color: white;
+    margin-bottom: 1.8rem;
+    box-shadow: 0 8px 24px rgba(22, 163, 74, 0.25);
+}
+.hero-box h1 {
+    color: white !important;
+    font-size: 2rem;
+    margin-bottom: 0.4rem;
+}
+.hero-box p {
+    color: rgba(255,255,255,0.92);
+    font-size: 1.02rem;
+    margin: 0;
+}
+
+/* Section label (pengganti header angka 1/2/3) */
+.section-label {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 1.15rem;
+    font-weight: 700;
+    color: #111827;
+    margin: 1.6rem 0 0.8rem 0;
+}
+
+/* Kartu generik */
+.info-card {
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 14px;
+    padding: 1.1rem 1.3rem;
+    margin-bottom: 0.9rem;
+}
+
+/* Kartu ringkasan profil (BBI / kebutuhan kalori) */
+.profile-metric {
+    background: var(--brand-green-light);
+    border-radius: 14px;
+    padding: 1rem 1.1rem;
+    margin-top: 0.6rem;
+    margin-bottom: 0.4rem;
+}
+.profile-metric .metric-title {
+    font-size: 0.82rem;
+    color: #166534;
+    font-weight: 600;
+    margin-bottom: 0.15rem;
+}
+.profile-metric .metric-value {
+    font-size: 1.4rem;
+    font-weight: 800;
+    color: #14532d;
+}
+.profile-metric .metric-sub {
+    font-size: 0.78rem;
+    color: #166534;
+}
+
+/* Kartu status hasil evaluasi */
+.status-card {
+    border-radius: 16px;
+    padding: 1.4rem 1.6rem;
+    margin: 1rem 0 1.2rem 0;
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+}
+.status-card .status-icon { font-size: 2.4rem; line-height: 1; }
+.status-card .status-title { font-size: 1.3rem; font-weight: 800; margin-bottom: 0.15rem; }
+.status-card .status-sub { font-size: 0.95rem; opacity: 0.9; }
+.status-aman { background: var(--brand-green-light); color: #14532d; }
+.status-dibatasi { background: var(--brand-amber-light); color: #78350f; }
+.status-tidakaman { background: var(--brand-red-light); color: #7f1d1d; }
+
+.upload-hint {
+    color: #6b7280;
+    font-size: 0.9rem;
+    margin-top: -0.4rem;
+    margin-bottom: 0.6rem;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# Tampilan (angka -> nama, satuan) untuk kebutuhan nutrisi harian
+NUTRIENT_DISPLAY_META = {
+    "karbohidrat_g": ("🍞 Karbohidrat", "g"),
+    "protein_g": ("🥩 Protein", "g"),
+    "lemak_total_g": ("🧈 Lemak Total", "g"),
+    "lemak_jenuh_g": ("🧈 Lemak Jenuh", "g"),
+    "mufa_g": ("🥑 Lemak Tak Jenuh Tunggal", "g"),
+    "pufa_g": ("🐟 Lemak Tak Jenuh Ganda", "g"),
+    "gula_g": ("🍬 Gula", "g"),
+    "kolesterol_mg": ("🥚 Kolesterol", "mg"),
+    "serat_g": ("🌾 Serat (minimal)", "g"),
+}
+
+
+def build_nutrition_table(daily_targets, consumption_limits, jenis_konsumsi):
+    persen = int(CONSUMPTION_TYPE_FACTORS[jenis_konsumsi] * 100)
+    rows = []
+    for key, (label, unit) in NUTRIENT_DISPLAY_META.items():
+        rows.append({
+            "Kandungan Gizi": label,
+            "Kebutuhan per Hari": f"{daily_targets[key]:g} {unit}",
+            f"Batas per Sekali Makan ({persen}%)": f"{consumption_limits[key]:g} {unit}",
+        })
+    return pd.DataFrame(rows)
+
+
+# ------------------------------------------------------------------
+# 8. HERO HEADER
 # ------------------------------------------------------------------
 NER_MODEL_PATH = os.environ.get("NER_MODEL_PATH", "model-best")
 
-st.title("🥗 OCR Label Gizi — Evaluasi Kelayakan Produk untuk Diet Diabetes")
-st.caption("PaddleOCR (PP-OCRv5) + spaCy NER + Rule Engine — diadaptasi dari notebook riset.")
+st.markdown(
+    """
+    <div class="hero-box">
+        <h1>🥗 DietCheck — Cek Gizi untuk Diet Diabetes</h1>
+        <p>Foto label kemasan makananmu, biar kami cek apakah aman, perlu dibatasi,
+        atau sebaiknya dihindari — berdasarkan kebutuhan harian tubuhmu sendiri.</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
+# ------------------------------------------------------------------
+# 9. SIDEBAR — PROFIL PENGGUNA
+# ------------------------------------------------------------------
 with st.sidebar:
-    st.header("1️⃣ Profil Pengguna")
+    st.markdown('<div class="section-label">👤 Profil Kamu</div>', unsafe_allow_html=True)
     gender = st.selectbox("Jenis Kelamin", ["Laki-laki", "Perempuan"])
     age = st.number_input("Umur (tahun)", min_value=1, max_value=120, value=30)
     weight = st.number_input("Berat Badan (kg)", min_value=1.0, max_value=300.0, value=60.0)
     height = st.number_input("Tinggi Badan (cm)", min_value=50.0, max_value=250.0, value=160.0)
-    activity = st.selectbox("Tingkat Aktivitas", list(ACTIVITY_FACTORS.keys()))
-    konsumsi = st.selectbox("Jenis Konsumsi Produk", list(CONSUMPTION_TYPE_FACTORS.keys()))
+    activity = st.selectbox(
+        "Seberapa Aktif Kamu Sehari-hari?",
+        list(ACTIVITY_FACTORS.keys()),
+        help="Pilih sesuai kebiasaan aktivitas fisikmu, dari jarang bergerak sampai sangat aktif.",
+    )
+    konsumsi = st.selectbox(
+        "Produk Ini Akan Dikonsumsi Sebagai",
+        list(CONSUMPTION_TYPE_FACTORS.keys()),
+        help="Makanan Utama = porsi makan besar. Snack/Minuman = camilan atau minuman ringan.",
+    )
 
     bbi = calculate_bbi(height)
     energi_basal = calculate_energi_basal(gender, bbi)
@@ -665,12 +824,46 @@ with st.sidebar:
     daily_targets = calculate_daily_nutrition_targets(energi_total)
     consumption_limits = calculate_consumption_limits(daily_targets, konsumsi)
 
-    st.markdown(f"**BBI:** {bbi:.1f} kg &nbsp;|&nbsp; **TDEE:** {energi_total:.0f} kkal")
-    with st.expander("Lihat kebutuhan nutrisi harian & batas konsumsi"):
-        st.json({"daily_targets": daily_targets, "consumption_limits (batas per produk)": consumption_limits})
+    st.markdown(
+        f"""
+        <div class="profile-metric">
+            <div class="metric-title">BERAT BADAN IDEAL KAMU</div>
+            <div class="metric-value">{bbi:.0f} kg</div>
+            <div class="metric-sub">Target berat badan sehat sesuai tinggi badanmu</div>
+        </div>
+        <div class="profile-metric">
+            <div class="metric-title">KEBUTUHAN KALORI HARIAN</div>
+            <div class="metric-value">{energi_total:.0f} kkal</div>
+            <div class="metric-sub">Energi yang tubuhmu butuhkan per hari</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
-st.header("2️⃣ Upload Foto Label Kemasan")
-uploaded_file = st.file_uploader("Foto label gizi (.jpg/.jpeg/.png)", type=["jpg", "jpeg", "png"])
+    with st.expander("📋 Lihat rincian kebutuhan nutrisi harian"):
+        st.caption(
+            "Ini batas gizi harian yang disarankan untukmu, dan berapa banyak yang "
+            "boleh berasal dari satu kali makan/minum produk ini."
+        )
+        st.dataframe(
+            build_nutrition_table(daily_targets, consumption_limits, konsumsi),
+            hide_index=True,
+            use_container_width=True,
+        )
+
+# ------------------------------------------------------------------
+# 10. UPLOAD FOTO
+# ------------------------------------------------------------------
+st.markdown('<div class="section-label">📸 Upload Foto Label Kemasan</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="upload-hint">Pastikan bagian "Informasi Nilai Gizi" terlihat jelas dan tidak buram.</div>',
+    unsafe_allow_html=True,
+)
+uploaded_file = st.file_uploader(
+    "Upload foto",
+    type=["jpg", "jpeg", "png"],
+    label_visibility="collapsed",
+)
 
 if uploaded_file is not None:
     if not os.path.isdir(NER_MODEL_PATH):
@@ -689,57 +882,76 @@ if uploaded_file is not None:
     ocr_engine = load_ocr_engine()
     nlp_ner = load_ner_model(NER_MODEL_PATH)
 
-    with st.spinner("Menjalankan OCR (mencari area 'Informasi Nilai Gizi') ..."):
+    with st.spinner("Sedang membaca label kemasan ..."):
         output_record = run_extraction_pipeline(ocr_engine, tmp_path)
 
     col1, col2 = st.columns(2)
     with col1:
-        st.subheader("Foto Asli")
+        st.markdown('<div class="section-label">🖼️ Foto Asli</div>', unsafe_allow_html=True)
         st.image(tmp_path, use_container_width=True)
     with col2:
-        st.subheader("Area Ter-crop")
+        st.markdown('<div class="section-label">✂️ Area Informasi Gizi</div>', unsafe_allow_html=True)
         if output_record["cropped_image_path"]:
             st.image(output_record["cropped_image_path"], use_container_width=True)
         else:
             st.warning("Area 'Informasi Nilai Gizi' tidak ditemukan. Coba foto dengan sudut/pencahayaan lebih baik.")
 
     if output_record["cropped_image_path"]:
-        st.subheader("3️⃣ Teks Hasil OCR")
-        st.text("\n".join(output_record["extracted_text_lines"]) or "(tidak ada teks terbaca)")
-
         ner_text_input = "\n".join(output_record["extracted_text_lines"])
-        with st.spinner("Menjalankan NER ..."):
+        with st.spinner("Menganalisis kandungan gizi ..."):
             doc = nlp_ner(ner_text_input)
             entities = extract_entities_with_confidence(nlp_ner, doc)
 
-        st.subheader("4️⃣ Entitas Terdeteksi (NER)")
-        if entities:
-            st.dataframe(pd.DataFrame(entities)[["entity", "value", "confidence"]])
-        else:
-            st.warning("Tidak ada entitas gizi yang terdeteksi oleh model NER.")
-
-        st.subheader("5️⃣ Hasil Evaluasi Rule Engine — Diet Diabetes")
         rule_engine = RuleEngine()
         result = rule_engine.evaluate_diabetes(entities, output_record.get("nutrition_data"), consumption_limits)
 
-        status_color = {"Aman": "success", "Dibatasi": "warning", "Tidak Aman": "error"}[result["category"]]
-        getattr(st, status_color)(f"**Status: {result['category'].upper()}**")
+        # --- Kartu status utama ---
+        status_meta = {
+            "Aman": ("status-aman", "✅", "Aman Dikonsumsi",
+                     "Seluruh kandungan gizi produk ini masih sesuai batas kebutuhan harianmu."),
+            "Dibatasi": ("status-dibatasi", "⚠️", "Perlu Dibatasi",
+                         "Boleh dikonsumsi, tapi batasi jumlah sajiannya per hari sesuai saran di bawah."),
+            "Tidak Aman": ("status-tidakaman", "⛔", "Sebaiknya Dihindari",
+                           "Kandungan gizi produk ini sudah melebihi batas hanya dari 1 sajian."),
+        }
+        css_class, icon, title, sub = status_meta[result["category"]]
         st.markdown(
-            f"- Maksimal konsumsi harian: **{result['max_daily_servings']} sajian** "
-            f"(dari {result['servings_per_container']} sajian per kemasan)"
+            f"""
+            <div class="status-card {css_class}">
+                <div class="status-icon">{icon}</div>
+                <div>
+                    <div class="status-title">{title}</div>
+                    <div class="status-sub">{sub}</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
         )
+
+        c1, c2 = st.columns(2)
+        c1.metric("Maksimal Konsumsi per Hari", f"{result['max_daily_servings']} sajian")
+        c2.metric("Jumlah Sajian dalam Kemasan", f"{result['servings_per_container']} sajian")
+
         if result["rows"]:
-            st.dataframe(pd.DataFrame(result["rows"]))
+            st.markdown('<div class="section-label">📊 Rincian Kandungan Gizi vs Batas Amanmu</div>', unsafe_allow_html=True)
+            st.dataframe(pd.DataFrame(result["rows"]), hide_index=True, use_container_width=True)
+
         if result["reason"]:
-            with st.expander("Detail alasan evaluasi"):
+            with st.expander("💬 Kenapa hasilnya begini?"):
                 for r in result["reason"]:
                     st.write(f"• {r}")
 
-        with st.expander("Data mentah (JSON) untuk debugging"):
-            st.json({
-                "nutrition_data": output_record.get("nutrition_data"),
-                "entities": entities,
-                "rule_engine_result": result,
-            })
+        with st.expander("🔍 Detail teknis (teks OCR & entitas terdeteksi)"):
+            tab1, tab2 = st.tabs(["Teks Hasil OCR", "Data Mentah (JSON)"])
+            with tab1:
+                st.text("\n".join(output_record["extracted_text_lines"]) or "(tidak ada teks terbaca)")
+                if entities:
+                    st.dataframe(pd.DataFrame(entities)[["entity", "value", "confidence"]], hide_index=True, use_container_width=True)
+            with tab2:
+                st.json({
+                    "nutrition_data": output_record.get("nutrition_data"),
+                    "entities": entities,
+                    "rule_engine_result": result,
+                })
 else:
-    st.info("Silakan upload foto label kemasan untuk memulai.")
+    st.info("👆 Silakan upload foto label kemasan untuk memulai pengecekan.")
